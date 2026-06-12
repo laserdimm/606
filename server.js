@@ -1,6 +1,7 @@
 /*
   server.js
   UCP / Gemini Pay endpoints + Stripe and Coinbase Commerce integrations
+  + Loyalty pass generator (simulated) for local testing without provider keys
 */
 import express from 'express';
 import crypto from 'crypto';
@@ -8,6 +9,8 @@ import dotenv from 'dotenv';
 import { SignJWT, importJWK } from 'jose';
 import axios from 'axios';
 import Stripe from 'stripe';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
@@ -24,6 +27,10 @@ const COINBASE_KEY = process.env.COINBASE_COMMERCE_API_KEY || '';
 const COINBASE_WEBHOOK_SECRET = process.env.COINBASE_WEBHOOK_SECRET || '';
 
 const app = express();
+
+// Ensure passes directory exists for generated loyalty passes (dev only)
+const PASSES_DIR = path.join(process.cwd(), 'passes');
+if (!fs.existsSync(PASSES_DIR)) fs.mkdirSync(PASSES_DIR, { recursive: true });
 
 // Stripe webhook needs the raw body to verify signature. Register this route BEFORE express.json()
 app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -111,6 +118,31 @@ async function signPayload(payload) {
 // In-memory order store (for prototype/demo)
 const orders = new Map();
 
+// Utility: generate a simple loyalty pass JSON file for a completed order (dev only)
+async function generateLoyaltyPass(order) {
+  const now = new Date();
+  const pass = {
+    pass_type: 'loyalty',
+    receiptId: order.receiptId,
+    merchant: MERCHANT_ID,
+    program_name: order.session?.merchant_name || MERCHANT_ID,
+    cardholder_name: order.session?.customer_name || 'Guest',
+    membership_number: order.receiptId,
+    points_balance: order.points_balance ?? Math.floor(Math.random() * 1000),
+    tier: order.tier || 'Bronze',
+    barcode: { type: 'qr', value: `https://example.com/loyalty/${order.receiptId}` },
+    issued_at: now.toISOString(),
+    metadata: {
+      sessionId: order.session?.id || null,
+      completed_at: order.completed_at || now.toISOString(),
+    },
+  };
+
+  const filePath = path.join(PASSES_DIR, `${order.receiptId}.json`);
+  await fs.promises.writeFile(filePath, JSON.stringify(pass, null, 2), 'utf8');
+  return `/wallet/loyalty/${order.receiptId}`; // endpoint to download the pass
+}
+
 // UCP session create (Gemini client will call this during checkout)
 app.post('/ucp/session/create', async (req, res) => {
   const { cart } = req.body || {};
@@ -149,10 +181,44 @@ app.post('/ucp/session/complete', async (req, res) => {
   order.receiptId = receiptId;
   orders.set(sessionId, order);
 
-  // TODO: after completion generate Samsung Wallet pass and attach pass URL to order
+  // Generate loyalty pass (dev/simulated)
+  try {
+    const passUrl = await generateLoyaltyPass(order);
+    order.loyalty_pass_url = passUrl;
+    orders.set(sessionId, order);
+  } catch (err) {
+    console.warn('Failed to generate loyalty pass:', err);
+  }
+
   const completion = { sessionId, receiptId, status: 'COMPLETED', merchant: MERCHANT_ID };
   const signature = await signPayload(completion);
-  res.json({ completion, signature });
+  res.json({ completion, signature, passUrl: order.loyalty_pass_url || null });
+});
+
+// Webhook receiver (Gemini / UCP events)
+app.post('/webhooks/gemini', async (req, res) => {
+  // NOTE: In production verify webhook signatures using the JWKS provided by Gemini / UCP
+  const event = req.body;
+  console.log('Webhook event:', event?.type || 'unknown', event);
+  // Handle event types: order.completed, payment.succeeded, etc.
+  if (event && event.type === 'order.completed' && event.sessionId) {
+    const order = orders.get(event.sessionId);
+    if (order) {
+      order.status = 'COMPLETED';
+      order.completed_at = new Date().toISOString();
+      const receiptId = order.receiptId || `rcpt_${crypto.randomUUID()}`;
+      order.receiptId = receiptId;
+      // Generate loyalty pass
+      try {
+        const passUrl = await generateLoyaltyPass(order);
+        order.loyalty_pass_url = passUrl;
+      } catch (err) {
+        console.warn('Failed to generate loyalty pass (webhook):', err);
+      }
+      orders.set(event.sessionId, order);
+    }
+  }
+  res.json({ received: true });
 });
 
 // Stripe: create a Checkout Session (server-side)
@@ -214,6 +280,16 @@ app.post('/create-checkout/crypto', async (req, res) => {
 app.post('/create-checkout/square', async (req, res) => {
   // TODO: implement Square Checkout/Payments when SQUARE_ACCESS_TOKEN and LOCATION_ID are provided
   res.json({ url: `https://squareup.com/checkout/mock/${crypto.randomUUID()}` });
+});
+
+// Endpoint to download the generated loyalty pass (dev: serves JSON pass bundle)
+app.get('/wallet/loyalty/:receiptId', async (req, res) => {
+  const { receiptId } = req.params;
+  const filePath = path.join(PASSES_DIR, `${receiptId}.json`);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'pass not found' });
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="loyalty-${receiptId}.json"`);
+  res.sendFile(filePath);
 });
 
 // Dev helper: view order state
